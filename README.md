@@ -1,6 +1,6 @@
-## Motion-S: Text-to-Sign Motion Generation Baseline.
+# Motion-S: Text-to-Sign Motion Generation Baseline.
 
-# 📌 Overview
+## 📌 Overview
 
 This project provides a baseline pipeline for the Motion-S Hierarchical Text-to-Motion Generation for Sign Language Kaggle competition.  
 The goal is to generate realistic human motion sequences representing sign language gestures from natural language sentences.
