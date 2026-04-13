@@ -87,7 +87,7 @@ class TrainConfig:
     res_num_heads:   int   = 8
     res_num_layers:  int   = 8
     ffn_dim:         int   = 2048
-    max_seq_len:     int   = 256
+    max_seq_len:     int   = 512
     dropout:         float = 0.1
 
     # ── Masking ───────────────────────────────────────────────────────────
