@@ -135,8 +135,20 @@ class SinusoidalPositionalEncoding(nn.Module):
         Returns:
               : [B, S, D]
         """
-        # self.pe is [1, max_seq_len, D]; slice to [1, S, D] and broadcast over B
-        x = x + self.pe[:, : x.size(1)]
+        seq_len = x.size(1)
+        # Extend the PE buffer on-the-fly if the sequence is longer than pre-allocated
+        if seq_len > self.pe.size(1):
+            hidden_dim = self.pe.size(2)
+            position = torch.arange(seq_len, dtype=torch.float, device=x.device).unsqueeze(1)
+            div_term = torch.exp(
+                torch.arange(0, hidden_dim, 2, dtype=torch.float, device=x.device)
+                * (-math.log(10000.0) / hidden_dim)
+            )
+            pe = torch.zeros(1, seq_len, hidden_dim, device=x.device)
+            pe[0, :, 0::2] = torch.sin(position * div_term)
+            pe[0, :, 1::2] = torch.cos(position * div_term)
+            self.register_buffer("pe", pe)
+        x = x + self.pe[:, :seq_len]
         return self.dropout(x)
 
 
