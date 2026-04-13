@@ -19,7 +19,7 @@ LOG_DIR=$WORKDIR/logs
 mkdir -p "$CKPT_DIR" "$LOG_DIR"
 
 # ── Environment ────────────────────────────────────────────────────────────────
-module load cuda/12.3.0
+module load cuda/12.1.1
 
 # Use the existing conda environment or fall back to the system Python
 if command -v conda &>/dev/null && conda env list | grep -q "^vit-cd "; then
@@ -35,10 +35,11 @@ echo "Python: $PYTHON"
 echo "CUDA devices: $CUDA_VISIBLE_DEVICES"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-# ── Install missing Python deps (first run only) ───────────────────────────────
-# Install PyTorch with CUDA 12.1 support (compatible with driver >= 12.3)
-$PYTHON -m pip install --quiet --user \
-    torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# ── Install / refresh Python deps ─────────────────────────────────────────────
+# Force-reinstall PyTorch cu121 so the CUDA build replaces any CPU-only install
+$PYTHON -m pip install --quiet --user --force-reinstall \
+    "torch==2.5.1+cu121" "torchvision==0.20.1+cu121" \
+    --index-url https://download.pytorch.org/whl/cu121
 $PYTHON -m pip install --quiet --user \
     transformers sentencepiece pandas numpy tqdm
 
