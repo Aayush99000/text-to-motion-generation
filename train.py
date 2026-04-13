@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -412,11 +413,13 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        # ── bookkeeping ───────────────────────────────────────────────────
-        total_loss    += loss.item()
-        base_loss_sum += base_loss.item()
-        res_loss_sum  += res_loss.item()
-        n_batches     += 1
+        # ── bookkeeping (skip NaN batches from epoch average) ────────────
+        loss_val = loss.item()
+        if math.isfinite(loss_val):
+            total_loss    += loss_val
+            base_loss_sum += base_loss.item()
+            res_loss_sum  += res_loss.item()
+            n_batches     += 1
 
         if (batch_idx + 1) % cfg.log_every == 0:
             elapsed     = time.perf_counter() - t0
