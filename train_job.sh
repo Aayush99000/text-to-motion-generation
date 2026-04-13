@@ -36,10 +36,11 @@ echo "CUDA devices: $CUDA_VISIBLE_DEVICES"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 # ── Install missing Python deps (first run only) ───────────────────────────────
+# Install PyTorch with CUDA 12.1 support (compatible with driver >= 12.3)
 $PYTHON -m pip install --quiet --user \
-    torch torchvision \
-    transformers sentencepiece \
-    pandas numpy tqdm
+    torch torchvision --index-url https://download.pytorch.org/whl/cu121
+$PYTHON -m pip install --quiet --user \
+    transformers sentencepiece pandas numpy tqdm
 
 # ── Launch training ────────────────────────────────────────────────────────────
 cd "$WORKDIR"

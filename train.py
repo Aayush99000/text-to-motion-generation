@@ -392,8 +392,8 @@ def train_one_epoch(
             # res_logits    [B, 5, S, 512]  →  view(-1, 512)  →  [B*5*S, 512]
             # residual_targets [B, 5, S]   →  view(-1)        →  [B*5*S]
             res_loss = criterion(
-                res_logits.view(-1, VOCAB_SIZE),    # [B*5*S, 512]
-                residual_targets.view(-1),          # [B*5*S]
+                res_logits.reshape(-1, VOCAB_SIZE),    # [B*5*S, 512]
+                residual_targets.reshape(-1),          # [B*5*S]
             )
 
             # ── total loss: equal weighting of base and residual ──────────
@@ -608,7 +608,7 @@ def main(cfg: TrainConfig) -> None:
 
     # ── AMP GradScaler ────────────────────────────────────────────────────
     # enabled=False → all scaler calls become no-ops (safe on CPU/MPS)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # ── optional resume ───────────────────────────────────────────────────
     start_epoch = 0
