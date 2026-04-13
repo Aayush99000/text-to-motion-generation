@@ -71,7 +71,6 @@ class TrainConfig:
 
     # ── Paths ─────────────────────────────────────────────────────────────
     csv_path:    str = "data/train.csv"
-    token_dir:   str = "data/Motion-Features"
     ckpt_dir:    str = "checkpoints"
     resume_from: Optional[str] = None   # path to a .pth checkpoint to resume
 
@@ -538,7 +537,6 @@ def main(cfg: TrainConfig) -> None:
     # ── data loader ───────────────────────────────────────────────────────
     loader = build_dataloader(
         csv_path    = cfg.csv_path,
-        token_dir   = cfg.token_dir,
         tokenizer   = tokenizer,
         batch_size  = cfg.batch_size,
         max_text_len= cfg.max_text_len,
@@ -671,7 +669,6 @@ def _parse_args() -> TrainConfig:
 
     # paths
     p.add_argument("--csv",        default=defaults.csv_path,    help="path to train.csv")
-    p.add_argument("--token_dir",  default=defaults.token_dir,   help="path to motion token dir")
     p.add_argument("--ckpt_dir",   default=defaults.ckpt_dir,    help="checkpoint output dir")
     p.add_argument("--resume",     default=defaults.resume_from, help="checkpoint to resume from")
 
@@ -692,7 +689,6 @@ def _parse_args() -> TrainConfig:
 
     return TrainConfig(
         csv_path    = args.csv,
-        token_dir   = args.token_dir,
         ckpt_dir    = args.ckpt_dir,
         resume_from = args.resume,
         t5_model    = args.t5,

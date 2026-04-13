@@ -4,17 +4,22 @@ dataset.py — Data loading and batching for the KSL Text-to-Motion model
 
 Components
 ──────────
-  KSLMotionDataset : torch.utils.data.Dataset that reads train.csv and loads
-                     pre-tokenized motion tensors from disk.
+  KSLMotionDataset : torch.utils.data.Dataset that reads train.csv and parses
+                     pre-tokenized RVQ motion tokens from CSV columns.
   MotionCollator   : Callable collate function that dynamically pads variable-
                      length motion token sequences within a batch.
 
-Motion token file format
-────────────────────────
-  Each sample has a corresponding file in the token directory named
-  ``{id}.pt`` (PyTorch) or ``{id}.npy`` (NumPy).  The tensor shape is
-  ``[seq_len, 6]`` where 6 corresponds to the six RVQ layers
-  (layer 0 = base motion, layers 1-5 = fine residuals).
+CSV token columns
+─────────────────
+  The competition CSV contains six space-separated token columns per row:
+      base_tokens  : Layer-0 (base) token ids
+      residual_1   : Residual layer 1 token ids
+      residual_2   : Residual layer 2 token ids
+      residual_3   : Residual layer 3 token ids
+      residual_4   : Residual layer 4 token ids
+      residual_5   : Residual layer 5 token ids
+
+  These are parsed and stacked into a [seq_len, 6] tensor per sample.
 
 Token ID conventions (must match model.py)
 ──────────────────────────────────────────
@@ -27,7 +32,7 @@ Token ID conventions (must match model.py)
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -42,6 +47,10 @@ from transformers import PreTrainedTokenizerBase
 MOTION_PAD_ID: int  = 512   # padding value for motion sequences (= MASK_TOKEN_ID)
 NUM_RVQ_LAYERS: int = 6     # number of RVQ layers per motion frame
 
+# Ordered column names for the 6 RVQ layers in the CSV
+_TOKEN_COLUMNS = ["base_tokens", "residual_1", "residual_2",
+                  "residual_3",  "residual_4", "residual_5"]
+
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
 
@@ -49,48 +58,44 @@ class KSLMotionDataset(Dataset):
     """
     PyTorch Dataset for Korean Sign Language (KSL) text-to-motion generation.
 
-    Reads sample metadata from a CSV file and lazily loads pre-computed RVQ
-    motion tokens from disk on each ``__getitem__`` call.
+    Reads sample metadata and pre-computed RVQ motion tokens directly from
+    the competition CSV file.  No separate token files are required.
 
     CSV schema
     ──────────
     Required columns:
-        id       : unique sample identifier (used to locate the motion file)
-        sentence : natural English description of the sign
-        gloss    : sign-language grammar (space-separated gloss words)
+        id          : unique sample identifier
+        sentence    : natural English description of the sign
+        gloss       : sign-language grammar (space-separated gloss words)
+        base_tokens : space-separated Layer-0 token ids
+        residual_1 … residual_5 : space-separated residual layer token ids
 
     Args:
-        csv_path     : path to ``train.csv`` (or ``val.csv`` / ``test.csv``)
-        token_dir    : directory that contains ``{id}.pt`` or ``{id}.npy`` files
+        csv_path     : path to ``train.csv`` (or ``test.csv``)
         tokenizer    : HuggingFace tokenizer (e.g. ``T5TokenizerFast``)
         max_text_len : maximum number of text tokens; longer sequences are
                        truncated, shorter ones are padded to this length
         use_gloss    : if ``True``, tokenise the ``gloss`` column instead of
                        ``sentence``
-        skip_missing : if ``True``, silently drop rows whose motion file cannot
-                       be found on disk; if ``False``, raise ``FileNotFoundError``
     """
 
     def __init__(
         self,
         csv_path: Union[str, Path],
-        token_dir: Union[str, Path],
         tokenizer: PreTrainedTokenizerBase,
         max_text_len: int = 64,
         use_gloss: bool = False,
-        skip_missing: bool = True,
     ) -> None:
         super().__init__()
 
-        self.token_dir   = Path(token_dir)
-        self.tokenizer   = tokenizer
+        self.tokenizer    = tokenizer
         self.max_text_len = max_text_len
-        self.text_column = "gloss" if use_gloss else "sentence"
+        self.text_column  = "gloss" if use_gloss else "sentence"
 
         # ── load and validate the CSV ──────────────────────────────────────
         df = pd.read_csv(csv_path)
 
-        required = {"id", "sentence", "gloss"}
+        required = {"id", "sentence"} | set(_TOKEN_COLUMNS)
         missing  = required - set(df.columns)
         if missing:
             raise ValueError(
@@ -100,24 +105,15 @@ class KSLMotionDataset(Dataset):
 
         df["id"] = df["id"].astype(str)
 
-        # ── optionally filter rows with missing motion files ───────────────
-        if skip_missing:
-            present = df["id"].apply(lambda sid: self._resolve_path(sid) is not None)
-            n_dropped = (~present).sum()
-            if n_dropped:
-                print(
-                    f"[KSLMotionDataset] Warning: dropping {n_dropped} samples "
-                    f"with no motion file in '{self.token_dir}'."
-                )
-            df = df[present].reset_index(drop=True)
-        else:
-            # validate upfront so the error is caught at construction time
-            for sid in df["id"]:
-                if self._resolve_path(sid) is None:
-                    raise FileNotFoundError(
-                        f"Motion file not found for id='{sid}' in '{self.token_dir}'. "
-                        f"Expected '{sid}.pt' or '{sid}.npy'."
-                    )
+        # Drop rows where any token column is NaN (test set has no tokens)
+        token_present = df[_TOKEN_COLUMNS].notna().all(axis=1)
+        n_dropped = (~token_present).sum()
+        if n_dropped:
+            print(
+                f"[KSLMotionDataset] Warning: dropping {n_dropped} rows "
+                f"with missing token columns (test-set rows?)."
+            )
+        df = df[token_present].reset_index(drop=True)
 
         self.records: pd.DataFrame = df
         print(
@@ -132,10 +128,7 @@ class KSLMotionDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, int]]:
         """
-        Load and return one training sample.
-
-        Args:
-            idx : integer index into the dataset
+        Return one training sample parsed from the CSV row.
 
         Returns a dictionary with the following keys:
 
@@ -162,87 +155,54 @@ class KSLMotionDataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
-        # tokenizer returns [1, L]; squeeze the batch dim
         input_ids      = encoding["input_ids"].squeeze(0)       # [max_text_len]
         attention_mask = encoding["attention_mask"].squeeze(0)  # [max_text_len]
 
-        # ── load motion tokens ─────────────────────────────────────────────
-        motion_tokens = self._load_motion(str(row["id"]))  # [seq_len, 6]
+        # ── parse motion tokens from CSV columns ───────────────────────────
+        motion_tokens = self._parse_tokens(row)  # [seq_len, 6]
 
         return {
-            "input_ids"     : input_ids,           # [max_text_len]     long
-            "attention_mask": attention_mask,       # [max_text_len]     long
-            "motion_tokens" : motion_tokens,        # [seq_len, 6]       long
-            "motion_length" : motion_tokens.size(0),# scalar             int
+            "input_ids"     : input_ids,
+            "attention_mask": attention_mask,
+            "motion_tokens" : motion_tokens,
+            "motion_length" : motion_tokens.size(0),
         }
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _resolve_path(self, sample_id: str) -> Optional[Path]:
+    def _parse_tokens(self, row: pd.Series) -> torch.Tensor:
         """
-        Return the first existing motion file path for ``sample_id``, or
-        ``None`` if neither ``.pt`` nor ``.npy`` exists.
+        Parse the six token columns from a CSV row into a [seq_len, 6] tensor.
 
-        Lookup order: ``{id}.pt`` → ``{id}.npy``
+        All six columns must have the same number of space-separated integers
+        (one per motion frame).  Token ids are clipped to [0, 511] as a safety
+        measure against any out-of-range values in the source data.
         """
-        for ext in (".pt", ".npy"):
-            p = self.token_dir / f"{sample_id}{ext}"
-            if p.exists():
-                return p
-        return None
+        layers = []
+        for col in _TOKEN_COLUMNS:
+            ids = [int(x) for x in str(row[col]).split()]
+            layers.append(ids)
 
-    def _load_motion(self, sample_id: str) -> torch.Tensor:
-        """
-        Load a motion token tensor from disk.
+        # All layers must have the same sequence length
+        seq_len = len(layers[0])
+        for i, layer in enumerate(layers[1:], 1):
+            if len(layer) != seq_len:
+                raise ValueError(
+                    f"Token column length mismatch for id='{row['id']}': "
+                    f"base_tokens has {seq_len} tokens but "
+                    f"'{_TOKEN_COLUMNS[i]}' has {len(layer)} tokens."
+                )
 
-        Supports both PyTorch (``.pt``) and NumPy (``.npy``) formats.
-        The loaded tensor is cast to ``torch.long`` and validated to have
-        exactly ``NUM_RVQ_LAYERS`` (6) columns.
-
-        Args:
-            sample_id : the string id of the sample (not the full path)
-
-        Returns:
-            motion_tokens : [seq_len, NUM_RVQ_LAYERS]  dtype=torch.long
-
-        Raises:
-            FileNotFoundError : if neither ``.pt`` nor ``.npy`` exists
-            ValueError        : if the loaded tensor does not have 6 columns
-        """
-        path = self._resolve_path(sample_id)
-        if path is None:
-            raise FileNotFoundError(
-                f"No motion file found for id='{sample_id}' in '{self.token_dir}'."
-            )
-
-        if path.suffix == ".pt":
-            tokens = torch.load(path, map_location="cpu")
-            if not isinstance(tokens, torch.Tensor):
-                tokens = torch.tensor(tokens)
-        else:  # .npy
-            tokens = torch.from_numpy(np.load(str(path)))
-
-        tokens = tokens.long()  # ensure dtype is torch.int64
-
-        if tokens.ndim == 1:
-            # some files might store a single-layer [seq_len] tensor → unsqueeze
-            tokens = tokens.unsqueeze(-1)
-
-        if tokens.shape[-1] != NUM_RVQ_LAYERS:
-            raise ValueError(
-                f"Expected motion tensor with {NUM_RVQ_LAYERS} RVQ layers "
-                f"(columns), got shape {tuple(tokens.shape)} for id='{sample_id}'."
-            )
-
-        return tokens  # [seq_len, 6]
+        # Stack into [6, seq_len] then transpose to [seq_len, 6]
+        tensor = torch.tensor(layers, dtype=torch.long).T  # [seq_len, 6]
+        return tensor
 
     def __repr__(self) -> str:
         return (
             f"KSLMotionDataset("
             f"n_samples={len(self)}, "
             f"text_column='{self.text_column}', "
-            f"max_text_len={self.max_text_len}, "
-            f"token_dir='{self.token_dir}')"
+            f"max_text_len={self.max_text_len})"
         )
 
 
@@ -347,12 +307,10 @@ class MotionCollator:
 
 def build_dataloader(
     csv_path: Union[str, Path],
-    token_dir: Union[str, Path],
     tokenizer: PreTrainedTokenizerBase,
     batch_size: int = 32,
     max_text_len: int = 64,
     use_gloss: bool = False,
-    skip_missing: bool = True,
     shuffle: bool = True,
     num_workers: int = 4,
     pin_memory: bool = True,
@@ -361,14 +319,15 @@ def build_dataloader(
     Convenience function that constructs a ``KSLMotionDataset`` and wraps it
     in a ``DataLoader`` with the custom ``MotionCollator``.
 
+    Tokens are read directly from the CSV columns — no separate token
+    directory is needed.
+
     Args:
-        csv_path     : path to the CSV file
-        token_dir    : directory containing ``{id}.pt`` / ``{id}.npy`` files
+        csv_path     : path to the CSV file (must contain token columns)
         tokenizer    : HuggingFace tokenizer
         batch_size   : number of samples per batch
         max_text_len : maximum tokenised text length
         use_gloss    : use gloss column instead of sentence
-        skip_missing : drop samples whose motion file is absent
         shuffle      : shuffle the dataset each epoch (set False for val/test)
         num_workers  : DataLoader worker processes
         pin_memory   : pin memory for faster GPU transfer
@@ -379,11 +338,9 @@ def build_dataloader(
     """
     dataset = KSLMotionDataset(
         csv_path=csv_path,
-        token_dir=token_dir,
         tokenizer=tokenizer,
         max_text_len=max_text_len,
         use_gloss=use_gloss,
-        skip_missing=skip_missing,
     )
     collator = MotionCollator(motion_pad_id=MOTION_PAD_ID)
     return DataLoader(
@@ -399,26 +356,32 @@ def build_dataloader(
 # ─── Smoke test ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import tempfile, os
+    import tempfile
 
     print("Running dataset smoke test …")
 
-    # ── build a tiny synthetic dataset on disk ────────────────────────────
+    def _make_token_str(length: int) -> str:
+        return " ".join(str(torch.randint(0, 512, (1,)).item()) for _ in range(length))
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
-        # write a fake CSV
-        csv_path = tmpdir / "train.csv"
-        pd.DataFrame({
-            "id"      : ["001", "002", "003"],
-            "sentence": ["a man is running", "she is waving", "they are dancing"],
-            "gloss"   : ["MAN RUN", "SHE WAVE", "THEY DANCE"],
-        }).to_csv(csv_path, index=False)
-
-        # write fake motion tensors of different lengths
+        # Write a fake CSV with inline token columns
+        rows = []
         for sid, length in [("001", 20), ("002", 35), ("003", 12)]:
-            tokens = torch.randint(0, 512, (length, NUM_RVQ_LAYERS))
-            torch.save(tokens, tmpdir / f"{sid}.pt")
+            rows.append({
+                "id"        : sid,
+                "sentence"  : f"sentence for {sid}",
+                "gloss"     : f"GLOSS {sid}",
+                "base_tokens": _make_token_str(length),
+                "residual_1" : _make_token_str(length),
+                "residual_2" : _make_token_str(length),
+                "residual_3" : _make_token_str(length),
+                "residual_4" : _make_token_str(length),
+                "residual_5" : _make_token_str(length),
+            })
+        csv_path = tmpdir / "train.csv"
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
 
         # use a real T5 tokenizer if available, else fall back to a mock
         try:
@@ -426,11 +389,10 @@ if __name__ == "__main__":
             tokenizer = T5TokenizerFast.from_pretrained("t5-base")
             print("  Using real T5TokenizerFast")
         except Exception:
-            # minimal mock tokenizer for environments without model weights
             class _MockTokenizer:
                 pad_token_id = 0
                 def __call__(self, text, max_length, padding, truncation, return_tensors):
-                    ids = torch.zeros(1, max_length, dtype=torch.long)
+                    ids  = torch.zeros(1, max_length, dtype=torch.long)
                     mask = torch.ones(1, max_length, dtype=torch.long)
                     return {"input_ids": ids, "attention_mask": mask}
             tokenizer = _MockTokenizer()
@@ -439,11 +401,9 @@ if __name__ == "__main__":
         # ── dataset ───────────────────────────────────────────────────────
         dataset = KSLMotionDataset(
             csv_path=csv_path,
-            token_dir=tmpdir,
             tokenizer=tokenizer,
             max_text_len=32,
             use_gloss=False,
-            skip_missing=False,
         )
         print(f"  {dataset}")
         assert len(dataset) == 3
@@ -465,17 +425,11 @@ if __name__ == "__main__":
         print(f"  motion_lengths               : {batch['motion_lengths'].tolist()}")
         print(f"  motion_padding_mask (batched): {tuple(batch['motion_padding_mask'].shape)}")
 
-        # verify shapes
-        B, max_len = 3, 35   # longest sequence in this batch
+        B, max_len = 3, 35
         assert batch["motion_tokens"].shape       == (B, max_len, NUM_RVQ_LAYERS)
         assert batch["motion_padding_mask"].shape == (B, max_len)
-
-        # verify that padded positions are correctly flagged
-        # sample 003 has length 12; positions 12..34 should be True (padding)
         assert batch["motion_padding_mask"][2, 12:].all()
         assert not batch["motion_padding_mask"][2, :12].any()
-
-        # verify padded positions hold MOTION_PAD_ID
         assert (batch["motion_tokens"][2, 12:, :] == MOTION_PAD_ID).all()
 
     print("All checks passed.")
