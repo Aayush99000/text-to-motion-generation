@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=setup-env
-#SBATCH --partition=gpu
+#SBATCH --partition=sharing
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -23,14 +23,13 @@ echo " Node   : $(hostname)"
 echo " GPU    : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
 echo "=============================="
 
-# ── Load modules ──────────────────────────────────────────────────────────────
+# ── Load anaconda module only (PyTorch pip wheel bundles its own CUDA runtime) ──
 module load anaconda3/2024.06
-module load cuda/12.1.1
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
 # ── Remove old env if exists ──────────────────────────────────────────────────
-if conda env list | grep -q "^${ENV_NAME} \|${ENV_DIR}"; then
+if conda env list | grep -q "${ENV_DIR}"; then
     echo "[setup] Removing existing '${ENV_NAME}' env..."
     conda env remove -p "$ENV_DIR" -y
 fi
@@ -39,20 +38,22 @@ fi
 echo "[setup] Creating '${ENV_NAME}' with Python 3.11..."
 conda create -p "$ENV_DIR" python=3.11 -y
 
-conda activate "$ENV_DIR"
 PYTHON="$ENV_DIR/bin/python"
 PIP="$ENV_DIR/bin/pip"
 
 echo "[setup] Python: $($PYTHON --version)"
 
-# ── Install PyTorch cu121 (Python 3.11, fully supported) ─────────────────────
-echo "[setup] Installing PyTorch cu121..."
+# ── Install all non-torch deps via conda-forge (prebuilt, no compiler needed) ─
+echo "[setup] Installing deps via conda-forge..."
+conda install -p "$ENV_DIR" -c conda-forge \
+    numpy pandas tqdm sentencepiece transformers -y
+
+$PIP install --upgrade pip
+
+# ── Install PyTorch cu121 via pip (conda torch lacks proper CUDA build) ──────
+echo "[setup] Installing PyTorch + torchvision (cu121)..."
 $PIP install torch torchvision \
     --index-url https://download.pytorch.org/whl/cu121
-
-# ── Install remaining dependencies ───────────────────────────────────────────
-echo "[setup] Installing transformers, sentencepiece, pandas, numpy, tqdm..."
-$PIP install transformers sentencepiece pandas numpy tqdm
 
 # ── Verify everything ─────────────────────────────────────────────────────────
 echo ""
@@ -69,7 +70,6 @@ print('sentencepiece :', sentencepiece.__version__)
 print('pandas        :', pandas.__version__)
 print('numpy         :', numpy.__version__)
 
-# Quick tensor test on GPU
 if torch.cuda.is_available():
     x = torch.randn(3, 4).cuda()
     print('GPU tensor test: PASSED', x.shape)

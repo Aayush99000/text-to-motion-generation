@@ -415,8 +415,8 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=cfg.grad_clip)
 
             scaler.step(optimizer)
+            scaler.update()
 
-        scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
         # ── bookkeeping ───────────────────────────────────────────────────

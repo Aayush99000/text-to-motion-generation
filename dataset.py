@@ -84,13 +84,15 @@ class KSLMotionDataset(Dataset):
         csv_path: Union[str, Path],
         tokenizer: PreTrainedTokenizerBase,
         max_text_len: int = 64,
+        max_motion_len: int = 512,
         use_gloss: bool = False,
     ) -> None:
         super().__init__()
 
-        self.tokenizer    = tokenizer
-        self.max_text_len = max_text_len
-        self.text_column  = "gloss" if use_gloss else "sentence"
+        self.tokenizer     = tokenizer
+        self.max_text_len  = max_text_len
+        self.max_motion_len = max_motion_len
+        self.text_column   = "gloss" if use_gloss else "sentence"
 
         # ── load and validate the CSV ──────────────────────────────────────
         df = pd.read_csv(csv_path)
@@ -195,6 +197,11 @@ class KSLMotionDataset(Dataset):
 
         # Stack into [6, seq_len] then transpose to [seq_len, 6]
         tensor = torch.tensor(layers, dtype=torch.long).T  # [seq_len, 6]
+
+        # Truncate to max_motion_len to keep memory bounded
+        if tensor.size(0) > self.max_motion_len:
+            tensor = tensor[:self.max_motion_len, :]
+
         return tensor
 
     def __repr__(self) -> str:
@@ -310,6 +317,7 @@ def build_dataloader(
     tokenizer: PreTrainedTokenizerBase,
     batch_size: int = 32,
     max_text_len: int = 64,
+    max_motion_len: int = 512,
     use_gloss: bool = False,
     shuffle: bool = True,
     num_workers: int = 4,
@@ -340,6 +348,7 @@ def build_dataloader(
         csv_path=csv_path,
         tokenizer=tokenizer,
         max_text_len=max_text_len,
+        max_motion_len=max_motion_len,
         use_gloss=use_gloss,
     )
     collator = MotionCollator(motion_pad_id=MOTION_PAD_ID)
