@@ -21,9 +21,12 @@ mkdir -p "$CKPT_DIR" "$LOG_DIR"
 # ── Environment ────────────────────────────────────────────────────────────────
 # momask-env venv (Python 3.13 + torch 2.5.1+cu121) lives in $HOME
 # python/3.13.5 module provides the required libpython3.13.so.1.0 runtime
-module load python/3.13.5 cuda/12.1.1
+module load anaconda3/2024.06 cuda/12.1.1
 
-PYTHON=/home/katoch.aa/momask-env/bin/python
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate /home/katoch.aa/.conda/envs/motion-s
+
+PYTHON=/home/katoch.aa/.conda/envs/motion-s/bin/python
 
 echo "Python  : $($PYTHON --version)"
 echo "GPU     : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
