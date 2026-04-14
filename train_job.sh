@@ -37,8 +37,9 @@ $PYTHON train.py \
     --ckpt_dir   "$CKPT_DIR" \
     --epochs     100 \
     --batch_size 32 \
-    --lr         1e-4 \
+    --lr         3e-5 \
     --t5         t5-base \
-    --seed       42
+    --seed       42 \
+    --resume     "$CKPT_DIR/checkpoint_epoch_034.pth"
 
 echo "Job finished at $(date)"

@@ -96,9 +96,9 @@ class TrainConfig:
     mask_ratio_high: float = 1.0        # maximum fraction of tokens masked per sample
 
     # ── Optimiser ─────────────────────────────────────────────────────────
-    lr:              float = 1e-4
+    lr:              float = 3e-5
     weight_decay:    float = 0.01
-    grad_clip:       float = 1.0        # max gradient norm (0 to disable)
+    grad_clip:       float = 0.5        # max gradient norm (0 to disable)
     betas:           Tuple = (0.9, 0.98)
 
     # ── Scheduler ─────────────────────────────────────────────────────────
@@ -351,7 +351,6 @@ def train_one_epoch(
         )
 
         # ── forward pass under AMP context ───────────────────────────────
-        optimizer.zero_grad(set_to_none=True)
         amp_ctx = torch.autocast(device_type=device.type, dtype=torch.float16,
                                   enabled=use_amp)
 
@@ -401,20 +400,26 @@ def train_one_epoch(
             loss = 0.5 * base_loss + 0.5 * res_loss
 
         # ── backward + gradient clipping + optimiser step ────────────────
-        scaler.scale(loss).backward()
-
-        if cfg.grad_clip > 0.0:
-            scaler.unscale_(optimizer)
-            all_params = (
-                list(text_encoder.parameters()) + list(model.parameters())
-            )
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=cfg.grad_clip)
-
-        scaler.step(optimizer)
-        scaler.update()
-
-        # ── bookkeeping (skip NaN batches from epoch average) ────────────
+        # Guard: if loss is NaN/inf, skip backward entirely to prevent
+        # corrupting model weights (GradScaler catches inf *gradients* but
+        # not NaN *loss* — a NaN loss would propagate NaN into weights).
         loss_val = loss.item()
+        if math.isfinite(loss_val):
+            scaler.scale(loss).backward()
+
+            if cfg.grad_clip > 0.0:
+                scaler.unscale_(optimizer)
+                all_params = (
+                    list(text_encoder.parameters()) + list(model.parameters())
+                )
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=cfg.grad_clip)
+
+            scaler.step(optimizer)
+
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+        # ── bookkeeping ───────────────────────────────────────────────────
         if math.isfinite(loss_val):
             total_loss    += loss_val
             base_loss_sum += base_loss.item()
