@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ksl-momask
+#SBATCH --job-name=ksl-momask-gloss
 #SBATCH --partition=sharing
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -13,10 +13,16 @@
 # ── Paths ──────────────────────────────────────────────────────────────────────
 WORKDIR=/scratch/katoch.aa/text-to-motion
 DATA_DIR=$WORKDIR/dataset
-CKPT_DIR=$WORKDIR/checkpoints
+CKPT_DIR=$WORKDIR/checkpoints_gloss
 LOG_DIR=$WORKDIR/logs
+TOTAL_EPOCHS=100
 
 mkdir -p "$CKPT_DIR" "$LOG_DIR"
+
+# ── Auto-chain: queue the next job immediately so it runs after this one ends ──
+# (handles both natural finish and SLURM time-limit kill)
+NEXT_JOB=$(sbatch --dependency=afterany:$SLURM_JOB_ID "$WORKDIR/train_job.sh" | awk '{print $4}')
+echo "Next job queued: $NEXT_JOB (will start after this job ends)"
 
 # ── Environment ────────────────────────────────────────────────────────────────
 module load anaconda3/2024.06
@@ -46,11 +52,20 @@ cd "$WORKDIR"
 $PYTHON train.py \
     --csv        "$DATA_DIR/train.csv" \
     --ckpt_dir   "$CKPT_DIR" \
-    --epochs     100 \
+    --epochs     $TOTAL_EPOCHS \
     --batch_size 8 \
     --lr         3e-5 \
     --t5         t5-base \
     --seed       42 \
+    --use_gloss  \
     $RESUME_FLAG
 
-echo "Job finished at $(date)"
+# ── Cancel next queued job if training is fully complete ──────────────────────
+LAST_CKPT=$(ls -t "$CKPT_DIR"/checkpoint_epoch_*.pth 2>/dev/null | head -1)
+LAST_EPOCH=$(echo "$LAST_CKPT" | grep -o '[0-9]\+' | tail -1)
+if [ -n "$LAST_EPOCH" ] && [ "$LAST_EPOCH" -ge "$TOTAL_EPOCHS" ]; then
+    echo "Training complete at epoch $LAST_EPOCH. Cancelling queued job $NEXT_JOB."
+    scancel $NEXT_JOB
+else
+    echo "Job finished at $(date). Epoch $LAST_EPOCH/$TOTAL_EPOCHS done. Next job $NEXT_JOB will continue."
+fi
