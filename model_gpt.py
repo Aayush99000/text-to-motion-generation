@@ -296,3 +296,151 @@ class T2MGPT(nn.Module):
 
         # Return motion tokens only (strip BOS)
         return tokens[0, 1:].cpu().tolist()
+
+    @torch.inference_mode()
+    def generate_batch(
+        self,
+        text_emb      : torch.Tensor,
+        max_new_tokens: int   = 768,
+        temperature   : float = 1.0,
+        top_k         : int   = 256,
+    ) -> list[list[int]]:
+        """
+        Autoregressively generate motion tokens for a batch using KV-cache.
+
+        Each step processes only the ONE new token (O(T) per step) instead of
+        recomputing the full growing sequence (O(T²) per step), reducing total
+        complexity from O(T³) → O(T²).
+
+        Args:
+            text_emb       : [B, S, text_dim]  T5 text embeddings
+            max_new_tokens : max tokens to generate (max_frames * 6)
+            temperature    : sampling temperature
+            top_k          : top-k logit filter
+
+        Returns:
+            List of B token lists (BOS/EOS stripped)
+        """
+        B        = text_emb.size(0)
+        device   = text_emb.device
+        C        = self.hidden_dim
+        H        = self.blocks[0].self_attn.num_heads
+        head_dim = C // H
+
+        # ── Pre-compute cross-attention KV from text (never changes) ──────────
+        context = self.text_proj(text_emb)  # [B, S, C]
+        S       = context.size(1)
+        cross_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for block in self.blocks:
+            k, v = block.cross_attn.kv(context).split(C, dim=-1)
+            k = k.view(B, S, H, head_dim).transpose(1, 2)   # [B, H, S, head_dim]
+            v = v.view(B, S, H, head_dim).transpose(1, 2)
+            cross_kv.append((k, v))
+
+        # ── Self-attention KV cache (grows by 1 at every step) ───────────────
+        empty = torch.zeros(B, H, 0, head_dim, device=device)
+        self_kv: list[tuple[torch.Tensor, torch.Tensor]] = [
+            (empty.clone(), empty.clone()) for _ in self.blocks
+        ]
+
+        done      = torch.zeros(B, dtype=torch.bool, device=device)
+        generated: list[list[int]] = [[] for _ in range(B)]
+        results:   list[list[int] | None] = [None] * B
+
+        # Feed BOS at position 0, then up to max_new_tokens tokens
+        cur_input = torch.full((B,), BOS_ID, dtype=torch.long, device=device)
+
+        for pos_idx in range(max_new_tokens + 1):  # pos 0 = BOS
+            if pos_idx >= self.max_seq_len:
+                break
+
+            # Embedding for the single new token
+            pos = torch.tensor([pos_idx], device=device)
+            x   = self.drop(
+                self.token_emb(cur_input).unsqueeze(1) +   # [B, 1, C]
+                self.pos_emb(pos).unsqueeze(0)              # [1, 1, C]
+            )   # [B, 1, C]
+
+            new_self_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+            for i, block in enumerate(self.blocks):
+                # ── Self-attention (KV-cached) ─────────────────────────────
+                x_norm = block.ln1(x)
+                q_new, k_new, v_new = block.self_attn.qkv(x_norm).split(C, dim=-1)
+                q_new = q_new.view(B, 1, H, head_dim).transpose(1, 2)  # [B,H,1,d]
+                k_new = k_new.view(B, 1, H, head_dim).transpose(1, 2)
+                v_new = v_new.view(B, 1, H, head_dim).transpose(1, 2)
+
+                k_past, v_past = self_kv[i]
+                k_full = torch.cat([k_past, k_new], dim=2)  # [B,H,T,d]
+                v_full = torch.cat([v_past, v_new], dim=2)
+                new_self_kv.append((k_full, v_full))
+
+                # q is always the LAST position → no causal mask needed
+                scale = block.self_attn.scale
+                attn  = F.softmax((q_new @ k_full.transpose(-2, -1)) * scale, dim=-1)
+                sa_out = (attn @ v_full).transpose(1, 2).contiguous().view(B, 1, C)
+                x = x + block.self_attn.resid_drop(block.self_attn.proj(sa_out))
+
+                # ── Cross-attention (pre-cached text KV) ───────────────────
+                x_norm2 = block.ln2(x)
+                q_c     = block.cross_attn.q(x_norm2).view(B, 1, H, head_dim).transpose(1, 2)
+                k_ctx, v_ctx = cross_kv[i]
+                attn_c  = F.softmax(
+                    (q_c @ k_ctx.transpose(-2, -1)) * block.cross_attn.scale, dim=-1
+                )
+                ca_out  = (attn_c @ v_ctx).transpose(1, 2).contiguous().view(B, 1, C)
+                x = x + block.cross_attn.resid_drop(block.cross_attn.proj(ca_out))
+
+                # ── FFN ────────────────────────────────────────────────────
+                x = x + block.ffn(block.ln3(x))
+
+            self_kv = new_self_kv
+
+            # Logits for next token
+            logits = self.head(self.ln_f(x))[:, 0, :]   # [B, TOTAL_VOCAB]
+
+            if pos_idx == max_new_tokens:
+                break   # reached limit; results saved below
+
+            # Mask BOS and PAD
+            logits[:, BOS_ID] = float("-inf")
+            logits[:, PAD_ID] = float("-inf")
+
+            # Top-k filter over motion token range
+            if top_k > 0:
+                k_filter = min(top_k, VOCAB_SIZE)
+                topk_vals, _ = logits[:, :VOCAB_SIZE].topk(k_filter, dim=-1)
+                threshold    = topk_vals[:, -1:]
+                logits[:, :VOCAB_SIZE] = logits[:, :VOCAB_SIZE].masked_fill(
+                    logits[:, :VOCAB_SIZE] < threshold, float("-inf")
+                )
+
+            # Sample
+            if temperature > 1e-8:
+                probs       = F.softmax(logits / temperature, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+            else:
+                next_tokens = logits.argmax(dim=-1)   # [B]
+
+            is_eos = next_tokens == EOS_ID
+
+            for i in range(B):
+                if is_eos[i] and not done[i]:
+                    results[i] = list(generated[i])
+                    done[i]    = True
+                elif not done[i]:
+                    generated[i].append(next_tokens[i].item())
+
+            if done.all():
+                break
+
+            next_tokens[done] = PAD_ID   # finished samples emit PAD (discarded)
+            cur_input = next_tokens
+
+        # Sequences that never emitted EOS
+        for i in range(B):
+            if results[i] is None:
+                results[i] = list(generated[i])
+
+        return results  # type: ignore[return-value]

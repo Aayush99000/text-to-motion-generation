@@ -48,9 +48,10 @@ class T2MGPTDataset(Dataset):
         self,
         csv_path    : str,
         tokenizer   : T5TokenizerFast,
-        max_text_len: int  = 64,
+        max_text_len: int  = 128,
         max_frames  : int  = MAX_FRAMES,
         use_gloss   : bool = False,
+        use_both    : bool = False,
     ) -> None:
         self.tokenizer    = tokenizer
         self.max_text_len = max_text_len
@@ -59,7 +60,6 @@ class T2MGPTDataset(Dataset):
         # Input length = 1 (BOS) + max_frames*6, Target length = max_frames*6 + 1 (EOS)
         self.max_seq_len  = max_frames * NUM_RVQ_LAYERS + 1
 
-        text_col = "gloss" if use_gloss else "sentence"
         df = pd.read_csv(csv_path)
 
         self.samples: List[Dict] = []
@@ -80,6 +80,16 @@ class T2MGPTDataset(Dataset):
                 skipped += 1
                 continue
 
+            # Build text from selected columns
+            if use_both:
+                gloss    = str(row.get("gloss",    "") or "").strip()
+                sentence = str(row.get("sentence", "") or "").strip()
+                text = f"{gloss} {sentence}".strip() if gloss else sentence
+            elif use_gloss:
+                text = str(row.get("gloss", "") or "")
+            else:
+                text = str(row.get("sentence", "") or "")
+
             # Interleave: frame-first → [l0_t0, l1_t0, ..., l5_t0, l0_t1, ...]
             flat: List[int] = []
             for t in range(L):
@@ -87,7 +97,7 @@ class T2MGPTDataset(Dataset):
                     flat.append(layers[layer][t])
 
             self.samples.append({
-                "text"  : str(row[text_col]),
+                "text"  : text,
                 "tokens": flat,   # L * 6 ints
             })
 
@@ -143,9 +153,10 @@ def build_gpt_dataloader(
     csv_path    : str,
     tokenizer   : T5TokenizerFast,
     batch_size  : int  = 8,
-    max_text_len: int  = 64,
+    max_text_len: int  = 128,
     max_frames  : int  = MAX_FRAMES,
     use_gloss   : bool = False,
+    use_both    : bool = False,
     num_workers : int  = 4,
 ) -> DataLoader:
     dataset = T2MGPTDataset(
@@ -153,6 +164,7 @@ def build_gpt_dataloader(
         max_text_len=max_text_len,
         max_frames=max_frames,
         use_gloss=use_gloss,
+        use_both=use_both,
     )
     return DataLoader(
         dataset,

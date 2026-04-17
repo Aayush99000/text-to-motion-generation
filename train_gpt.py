@@ -50,6 +50,7 @@ class TrainConfig:
     warmup    : int   = 500
     seed      : int   = 42
     use_gloss : bool  = False
+    use_both  : bool  = False
     resume    : str   = ""
 
 
@@ -72,6 +73,7 @@ def train(cfg: TrainConfig) -> None:
         batch_size  = cfg.batch_size,
         max_frames  = cfg.max_frames,
         use_gloss   = cfg.use_gloss,
+        use_both    = cfg.use_both,
         num_workers = 4,
     )
     print(f"[train] Batches/epoch : {len(loader)}")
@@ -90,11 +92,6 @@ def train(cfg: TrainConfig) -> None:
 
     # ── Resume ────────────────────────────────────────────────────────────
     start_epoch = 0
-    if cfg.resume:
-        ckpt = torch.load(cfg.resume, map_location=device)
-        model.load_state_dict(ckpt["model_state"])
-        start_epoch = ckpt["epoch"]
-        print(f"[train] Resumed from epoch {start_epoch} | loss {ckpt.get('loss', '?'):.4f}")
 
     # ── Optimiser ─────────────────────────────────────────────────────────
     optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.1, betas=(0.9, 0.95))
@@ -108,6 +105,18 @@ def train(cfg: TrainConfig) -> None:
 
     use_amp = device.type == "cuda"
     scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    if cfg.resume:
+        ckpt = torch.load(cfg.resume, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        start_epoch = ckpt["epoch"]
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        if "scheduler_state" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+        if "scaler_state" in ckpt and use_amp:
+            scaler.load_state_dict(ckpt["scaler_state"])
+        print(f"[train] Resumed from epoch {start_epoch} | loss {ckpt.get('loss', '?'):.4f}")
 
     Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
 
@@ -167,6 +176,9 @@ def train(cfg: TrainConfig) -> None:
             "epoch"              : epoch,
             "model_state"        : model.state_dict(),
             "text_encoder_state" : text_encoder.state_dict(),
+            "optimizer_state"    : optimizer.state_dict(),
+            "scheduler_state"    : scheduler.state_dict(),
+            "scaler_state"       : scaler.state_dict(),
             "config"             : cfg.__dict__,
             "loss"               : avg_loss,
         }, ckpt_path)
@@ -190,6 +202,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--warmup",     type=int,   default=500)
     p.add_argument("--seed",       type=int,   default=42)
     p.add_argument("--use_gloss",  action="store_true")
+    p.add_argument("--use_both",   action="store_true")
     p.add_argument("--resume",     default="")
     args = p.parse_args()
     return TrainConfig(**vars(args))

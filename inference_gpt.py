@@ -7,13 +7,15 @@ Run
   python inference_gpt.py \
     --checkpoint checkpoints_gpt/checkpoint_epoch_100.pth \
     --test_csv   dataset/test.csv \
-    --output     submission_gpt.csv
+    --output     submission_gpt.csv \
+    --batch_size 32
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 from pathlib import Path
 
 import torch
@@ -67,10 +69,18 @@ def run_inference(args: argparse.Namespace) -> None:
     with open(args.test_csv, newline="") as f:
         test_rows = list(csv.DictReader(f))
 
-    text_col       = "gloss" if args.use_gloss else "sentence"
+    if args.use_both:
+        text_col = "both"
+    elif args.use_gloss:
+        text_col = "gloss"
+    else:
+        text_col = "sentence"
     max_new_tokens = max_frames * NUM_RVQ_LAYERS
+    batch_size     = args.batch_size
+    n_batches      = math.ceil(len(test_rows) / batch_size)
 
     print(f"[inference] Samples    : {len(test_rows)}")
+    print(f"[inference] Batch size : {batch_size}  ({n_batches} batches)")
     print(f"[inference] Text col   : '{text_col}'")
     print(f"[inference] Max tokens : {max_new_tokens}")
     print(f"[inference] Temperature: {args.temperature}")
@@ -78,50 +88,58 @@ def run_inference(args: argparse.Namespace) -> None:
 
     out_rows = []
 
-    for row in tqdm(test_rows, desc="Generating", unit="sample"):
-        text = str(row.get(text_col, "") or "")
+    for batch_idx in tqdm(range(n_batches), desc="Generating", unit="batch"):
+        batch_rows = test_rows[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+        if text_col == "both":
+            texts = [
+                (str(row.get("gloss", "") or "").strip() + " " +
+                 str(row.get("sentence", "") or "").strip()).strip()
+                for row in batch_rows
+            ]
+        else:
+            texts = [str(row.get(text_col, "") or "") for row in batch_rows]
 
         enc = tokenizer(
-            text,
-            max_length      = 64,
-            padding         = "max_length",
-            truncation      = True,
-            return_tensors  = "pt",
+            texts,
+            max_length     = 128,
+            padding        = "max_length",
+            truncation     = True,
+            return_tensors = "pt",
         )
         input_ids      = enc["input_ids"].to(device)
         attention_mask = enc["attention_mask"].to(device)
 
-        text_emb = text_encoder(input_ids, attention_mask)  # [1, T, D]
+        text_emb = text_encoder(input_ids, attention_mask)  # [B, T, D]
 
-        tokens = model.generate(
+        batch_tokens = model.generate_batch(
             text_emb,
             max_new_tokens = max_new_tokens,
             temperature    = args.temperature,
             top_k          = args.top_k,
         )
 
-        # Ensure length is divisible by NUM_RVQ_LAYERS (6)
-        n = (len(tokens) // NUM_RVQ_LAYERS) * NUM_RVQ_LAYERS
-        if n == 0:
-            # Fallback: at least 1 frame of zeros
-            tokens = [0] * NUM_RVQ_LAYERS
-            n = NUM_RVQ_LAYERS
-        else:
-            tokens = tokens[:n]
+        for row, tokens in zip(batch_rows, batch_tokens):
+            # Ensure length is divisible by NUM_RVQ_LAYERS (6)
+            n = (len(tokens) // NUM_RVQ_LAYERS) * NUM_RVQ_LAYERS
+            if n == 0:
+                tokens = [0] * NUM_RVQ_LAYERS
+                n = NUM_RVQ_LAYERS
+            else:
+                tokens = tokens[:n]
 
-        # Reshape [n] → [L, 6]
-        L   = n // NUM_RVQ_LAYERS
-        arr = [tokens[i * NUM_RVQ_LAYERS:(i + 1) * NUM_RVQ_LAYERS] for i in range(L)]
+            # Reshape [n] → [L, 6]
+            L   = n // NUM_RVQ_LAYERS
+            arr = [tokens[i * NUM_RVQ_LAYERS:(i + 1) * NUM_RVQ_LAYERS] for i in range(L)]
 
-        out_rows.append({
-            "id"         : row["id"],
-            "base_tokens": " ".join(str(arr[i][0]) for i in range(L)),
-            "residual_1" : " ".join(str(arr[i][1]) for i in range(L)),
-            "residual_2" : " ".join(str(arr[i][2]) for i in range(L)),
-            "residual_3" : " ".join(str(arr[i][3]) for i in range(L)),
-            "residual_4" : " ".join(str(arr[i][4]) for i in range(L)),
-            "residual_5" : " ".join(str(arr[i][5]) for i in range(L)),
-        })
+            out_rows.append({
+                "id"         : row["id"],
+                "base_tokens": " ".join(str(arr[i][0]) for i in range(L)),
+                "residual_1" : " ".join(str(arr[i][1]) for i in range(L)),
+                "residual_2" : " ".join(str(arr[i][2]) for i in range(L)),
+                "residual_3" : " ".join(str(arr[i][3]) for i in range(L)),
+                "residual_4" : " ".join(str(arr[i][4]) for i in range(L)),
+                "residual_5" : " ".join(str(arr[i][5]) for i in range(L)),
+            })
 
     # Write submission CSV
     fieldnames = ["id", "base_tokens", "residual_1", "residual_2", "residual_3", "residual_4", "residual_5"]
@@ -151,8 +169,12 @@ def parse_args() -> argparse.Namespace:
                    help="Sampling temperature (lower = sharper)")
     p.add_argument("--top_k",       type=int,   default=256,
                    help="Top-k logit filter")
+    p.add_argument("--batch_size",  type=int,   default=32,
+                   help="Number of samples to generate in parallel")
     p.add_argument("--use_gloss",   action="store_true",
                    help="Use gloss column instead of sentence")
+    p.add_argument("--use_both",    action="store_true",
+                   help="Concatenate gloss + sentence as input text")
     return p.parse_args()
 
 
