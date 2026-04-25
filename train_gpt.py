@@ -135,10 +135,12 @@ def train(cfg: TrainConfig) -> None:
             motion_input   = batch["motion_input"].to(device)
             motion_target  = batch["motion_target"].to(device)
 
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                with torch.no_grad():
-                    text_emb = text_encoder(input_ids, attention_mask)  # [B, T, D]
+            # Compute text embeddings in float32 outside autocast — critical for
+            # t5-large stability (24 layers can overflow in float16)
+            with torch.no_grad():
+                text_emb = text_encoder(input_ids, attention_mask)  # [B, T, D] float32
 
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 logits = model(motion_input, text_emb)   # [B, T, TOTAL_VOCAB]
                 B, T, V = logits.shape
                 loss = criterion(logits.view(B * T, V), motion_target.view(B * T))
