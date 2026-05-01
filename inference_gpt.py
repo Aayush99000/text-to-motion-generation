@@ -84,7 +84,8 @@ def run_inference(args: argparse.Namespace) -> None:
     print(f"[inference] Text col   : '{text_col}'")
     print(f"[inference] Max tokens : {max_new_tokens}")
     print(f"[inference] Temperature: {args.temperature}")
-    print(f"[inference] Top-k      : {args.top_k}\n")
+    print(f"[inference] Top-k      : {args.top_k}")
+    print(f"[inference] CFG scale  : {args.guidance_scale}\n")
 
     out_rows = []
 
@@ -116,6 +117,7 @@ def run_inference(args: argparse.Namespace) -> None:
             max_new_tokens = max_new_tokens,
             temperature    = args.temperature,
             top_k          = args.top_k,
+            guidance_scale = args.guidance_scale,
         )
 
         for row, tokens in zip(batch_rows, batch_tokens):
@@ -171,10 +173,12 @@ def parse_args() -> argparse.Namespace:
                    help="Top-k logit filter")
     p.add_argument("--batch_size",  type=int,   default=32,
                    help="Number of samples to generate in parallel")
-    p.add_argument("--use_gloss",   action="store_true",
+    p.add_argument("--use_gloss",      action="store_true",
                    help="Use gloss column instead of sentence")
-    p.add_argument("--use_both",    action="store_true",
+    p.add_argument("--use_both",       action="store_true",
                    help="Concatenate gloss + sentence as input text")
+    p.add_argument("--guidance_scale", type=float, default=1.0,
+                   help="CFG guidance scale (1.0 = no CFG, try 3.0-7.5)")
     return p.parse_args()
 
 

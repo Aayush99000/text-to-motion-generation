@@ -49,9 +49,10 @@ class TrainConfig:
     grad_clip : float = 1.0
     warmup    : int   = 500
     seed      : int   = 42
-    use_gloss : bool  = False
-    use_both  : bool  = False
-    resume    : str   = ""
+    use_gloss   : bool  = False
+    use_both    : bool  = False
+    cfg_dropout : float = 0.1   # prob of nulling text emb during training (CFG)
+    resume      : str   = ""
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -140,6 +141,12 @@ def train(cfg: TrainConfig) -> None:
             with torch.no_grad():
                 text_emb = text_encoder(input_ids, attention_mask)  # [B, T, D] float32
 
+            # CFG dropout: randomly zero out text conditioning
+            if cfg.cfg_dropout > 0:
+                null_mask = (torch.rand(text_emb.size(0), device=device) < cfg.cfg_dropout)
+                text_emb  = text_emb.clone()
+                text_emb[null_mask] = 0.0
+
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 logits = model(motion_input, text_emb)   # [B, T, TOTAL_VOCAB]
                 B, T, V = logits.shape
@@ -203,9 +210,10 @@ def parse_args() -> TrainConfig:
     p.add_argument("--grad_clip",  type=float, default=1.0)
     p.add_argument("--warmup",     type=int,   default=500)
     p.add_argument("--seed",       type=int,   default=42)
-    p.add_argument("--use_gloss",  action="store_true")
-    p.add_argument("--use_both",   action="store_true")
-    p.add_argument("--resume",     default="")
+    p.add_argument("--use_gloss",    action="store_true")
+    p.add_argument("--use_both",     action="store_true")
+    p.add_argument("--cfg_dropout",  type=float, default=0.1)
+    p.add_argument("--resume",       default="")
     args = p.parse_args()
     return TrainConfig(**vars(args))
 

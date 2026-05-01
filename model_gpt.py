@@ -304,6 +304,7 @@ class T2MGPT(nn.Module):
         max_new_tokens: int   = 768,
         temperature   : float = 1.0,
         top_k         : int   = 256,
+        guidance_scale: float = 1.0,
     ) -> list[list[int]]:
         """
         Autoregressively generate motion tokens for a batch using KV-cache.
@@ -327,18 +328,26 @@ class T2MGPT(nn.Module):
         H        = self.blocks[0].self_attn.num_heads
         head_dim = C // H
 
+        # ── CFG: double the batch with null (zero) embeddings ────────────────
+        # Layout: [cond_0..cond_B-1, uncond_0..uncond_B-1]
+        use_cfg = guidance_scale > 1.0
+        if use_cfg:
+            null_emb  = torch.zeros_like(text_emb)
+            text_emb  = torch.cat([text_emb, null_emb], dim=0)  # [2B, S, D]
+        BS = text_emb.size(0)  # B or 2B
+
         # ── Pre-compute cross-attention KV from text (never changes) ──────────
-        context = self.text_proj(text_emb)  # [B, S, C]
+        context = self.text_proj(text_emb)  # [BS, S, C]
         S       = context.size(1)
         cross_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         for block in self.blocks:
             k, v = block.cross_attn.kv(context).split(C, dim=-1)
-            k = k.view(B, S, H, head_dim).transpose(1, 2)   # [B, H, S, head_dim]
-            v = v.view(B, S, H, head_dim).transpose(1, 2)
+            k = k.view(BS, S, H, head_dim).transpose(1, 2)   # [BS, H, S, head_dim]
+            v = v.view(BS, S, H, head_dim).transpose(1, 2)
             cross_kv.append((k, v))
 
         # ── Self-attention KV cache (grows by 1 at every step) ───────────────
-        empty = torch.zeros(B, H, 0, head_dim, device=device)
+        empty = torch.zeros(BS, H, 0, head_dim, device=device)
         self_kv: list[tuple[torch.Tensor, torch.Tensor]] = [
             (empty.clone(), empty.clone()) for _ in self.blocks
         ]
@@ -348,6 +357,7 @@ class T2MGPT(nn.Module):
         results:   list[list[int] | None] = [None] * B
 
         # Feed BOS at position 0, then up to max_new_tokens tokens
+        # For CFG: same tokens fed to both cond and uncond paths
         cur_input = torch.full((B,), BOS_ID, dtype=torch.long, device=device)
 
         for pos_idx in range(max_new_tokens + 1):  # pos 0 = BOS
@@ -355,11 +365,13 @@ class T2MGPT(nn.Module):
                 break
 
             # Embedding for the single new token
-            pos = torch.tensor([pos_idx], device=device)
+            # For CFG: replicate cur_input for both cond and uncond paths
+            pos       = torch.tensor([pos_idx], device=device)
+            inp       = torch.cat([cur_input, cur_input], dim=0) if use_cfg else cur_input
             x   = self.drop(
-                self.token_emb(cur_input).unsqueeze(1) +   # [B, 1, C]
-                self.pos_emb(pos).unsqueeze(0)              # [1, 1, C]
-            )   # [B, 1, C]
+                self.token_emb(inp).unsqueeze(1) +          # [BS, 1, C]
+                self.pos_emb(pos).unsqueeze(0)              # [1,  1, C]
+            )   # [BS, 1, C]
 
             new_self_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
 
@@ -367,9 +379,9 @@ class T2MGPT(nn.Module):
                 # ── Self-attention (KV-cached) ─────────────────────────────
                 x_norm = block.ln1(x)
                 q_new, k_new, v_new = block.self_attn.qkv(x_norm).split(C, dim=-1)
-                q_new = q_new.view(B, 1, H, head_dim).transpose(1, 2)  # [B,H,1,d]
-                k_new = k_new.view(B, 1, H, head_dim).transpose(1, 2)
-                v_new = v_new.view(B, 1, H, head_dim).transpose(1, 2)
+                q_new = q_new.view(BS, 1, H, head_dim).transpose(1, 2)  # [BS,H,1,d]
+                k_new = k_new.view(BS, 1, H, head_dim).transpose(1, 2)
+                v_new = v_new.view(BS, 1, H, head_dim).transpose(1, 2)
 
                 k_past, v_past = self_kv[i]
                 k_full = torch.cat([k_past, k_new], dim=2)  # [B,H,T,d]
@@ -379,17 +391,17 @@ class T2MGPT(nn.Module):
                 # q is always the LAST position → no causal mask needed
                 scale = block.self_attn.scale
                 attn  = F.softmax((q_new @ k_full.transpose(-2, -1)) * scale, dim=-1)
-                sa_out = (attn @ v_full).transpose(1, 2).contiguous().view(B, 1, C)
+                sa_out = (attn @ v_full).transpose(1, 2).contiguous().view(BS, 1, C)
                 x = x + block.self_attn.resid_drop(block.self_attn.proj(sa_out))
 
                 # ── Cross-attention (pre-cached text KV) ───────────────────
                 x_norm2 = block.ln2(x)
-                q_c     = block.cross_attn.q(x_norm2).view(B, 1, H, head_dim).transpose(1, 2)
+                q_c     = block.cross_attn.q(x_norm2).view(BS, 1, H, head_dim).transpose(1, 2)
                 k_ctx, v_ctx = cross_kv[i]
                 attn_c  = F.softmax(
                     (q_c @ k_ctx.transpose(-2, -1)) * block.cross_attn.scale, dim=-1
                 )
-                ca_out  = (attn_c @ v_ctx).transpose(1, 2).contiguous().view(B, 1, C)
+                ca_out  = (attn_c @ v_ctx).transpose(1, 2).contiguous().view(BS, 1, C)
                 x = x + block.cross_attn.resid_drop(block.cross_attn.proj(ca_out))
 
                 # ── FFN ────────────────────────────────────────────────────
@@ -398,7 +410,15 @@ class T2MGPT(nn.Module):
             self_kv = new_self_kv
 
             # Logits for next token
-            logits = self.head(self.ln_f(x))[:, 0, :]   # [B, TOTAL_VOCAB]
+            logits_all = self.head(self.ln_f(x))[:, 0, :]   # [BS, TOTAL_VOCAB]
+
+            # ── CFG blending ──────────────────────────────────────────────
+            if use_cfg:
+                logits_cond   = logits_all[:B]   # [B, TOTAL_VOCAB]
+                logits_uncond = logits_all[B:]   # [B, TOTAL_VOCAB]
+                logits = logits_uncond + guidance_scale * (logits_cond - logits_uncond)
+            else:
+                logits = logits_all              # [B, TOTAL_VOCAB]
 
             if pos_idx == max_new_tokens:
                 break   # reached limit; results saved below
